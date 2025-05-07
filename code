@@ -1,0 +1,195 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import math
+import random
+
+class Waypoint:
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
+
+class FlightPath:
+    def __init__(self, drone_id, waypoints, start_time, end_time):
+        self.drone_id = drone_id
+        self.waypoints = waypoints
+        self.start_time = start_time
+        self.end_time = end_time
+        self.segment_lengths = self._compute_lengths()
+        self.total_length = sum(self.segment_lengths)
+        self.segment_times = self._compute_segment_times()
+
+    def _compute_lengths(self):
+        return [math.sqrt(
+            (self.waypoints[i+1].x - self.waypoints[i].x)**2 +
+            (self.waypoints[i+1].y - self.waypoints[i].y)**2 +
+            (self.waypoints[i+1].z - self.waypoints[i].z)**2
+        ) for i in range(len(self.waypoints) - 1)]
+
+    def _compute_segment_times(self):
+        total_time = self.end_time - self.start_time
+        return [l / self.total_length * total_time for l in self.segment_lengths]
+
+def interpolate_segment(p1, p2, ratio):
+    return (
+        p1.x + ratio * (p2.x - p1.x),
+        p1.y + ratio * (p2.y - p1.y),
+        p1.z + ratio * (p2.z - p1.z)
+    )
+
+def get_position_at(flight, t):
+    if t <= flight.start_time:
+        p = flight.waypoints[0]
+        return (p.x, p.y, p.z)
+
+    time_passed = t - flight.start_time
+    for i, seg_time in enumerate(flight.segment_times):
+        if time_passed <= seg_time:
+            ratio = time_passed / seg_time
+            return interpolate_segment(flight.waypoints[i], flight.waypoints[i+1], ratio)
+        time_passed -= seg_time
+
+    p = flight.waypoints[-1]
+    return (p.x, p.y, p.z)
+
+def euclidean_distance(p1, p2):
+    return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
+
+def detect_conflicts(primary, others, buffer_radius=1.0, time_step=1.0):
+    t_start = min(f.start_time for f in [primary] + others)
+    t_end = max(f.end_time for f in [primary] + others)
+    for t in np.arange(t_start, t_end + time_step, time_step):
+        p_pos = get_position_at(primary, t)
+        for idx, o in enumerate(others):
+            o_pos = get_position_at(o, t)
+            dist = euclidean_distance(p_pos, o_pos)
+            if dist < buffer_radius and not (p_pos == (0, 0, 0) and t == 0):
+                return {
+                    'time': t,
+                    'location': p_pos,
+                    'conflict_with_index': idx,
+                    'distance': dist
+                }
+    return None
+
+def generate_parallel_simulated_drones(primary_path, num_drones=6):
+    # Get bounding box
+    xs = [p.x for p in primary_path.waypoints]
+    ys = [p.y for p in primary_path.waypoints]
+    zs = [p.z for p in primary_path.waypoints]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    zmin, zmax = min(zs), max(zs)
+
+    # Define direction of simulated paths (e.g., X direction)
+    sim_start_x = xmin 
+    sim_end_x = xmax 
+    y_range = np.linspace(ymin, ymax, num=num_drones)
+    z_range = np.linspace(zmin, zmax, num=num_drones)
+
+    drones = []
+    for i in range(num_drones):
+        y = y_range[i]
+        z = z_range[i]
+        start_wp = Waypoint(sim_start_x, y, z)
+        end_wp = Waypoint(sim_end_x, y, z)
+        start_variation = random.uniform(0, 5)
+        end_variation = random.uniform(-5, 5)
+        drones.append(FlightPath(
+            drone_id=f"Sim_{i+1}",
+            waypoints=[start_wp, end_wp],
+            start_time=primary_path.start_time + start_variation,
+            end_time=primary_path.end_time + end_variation
+        ))
+    return drones
+
+def animate_drones(primary, others, conflict):
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title("3D Drone Simulation")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+
+    all_drones = [primary] + others
+    all_positions = [wp for drone in all_drones for wp in drone.waypoints]
+    xs = [p.x for p in all_positions]
+    ys = [p.y for p in all_positions]
+    zs = [p.z for p in all_positions]
+    ax.set_xlim(min(xs) - 1, max(xs) + 1)
+    ax.set_ylim(min(ys) - 1, max(ys) + 1)
+    ax.set_zlim(min(zs) - 1, max(zs) + 1)
+
+    points = [ax.plot([], [], [], 'o')[0] for _ in all_drones]
+    trails = [[] for _ in all_drones]
+    lines = [ax.plot([], [], [], '--', alpha=0.5)[0] for _ in all_drones]
+    freeze = [False] * len(all_drones)
+    freeze_pos = [None] * len(all_drones)
+
+    if conflict:
+        conflict_idx = [0, conflict['conflict_with_index'] + 1]
+        conflict_time = conflict['time']
+    else:
+        conflict_idx = []
+        conflict_time = None
+
+    min_time = min(f.start_time for f in all_drones)
+    max_time = max(f.end_time for f in all_drones)
+
+    def update(t):
+        for i, f in enumerate(all_drones):
+            if freeze[i]:
+                pos = freeze_pos[i]
+            else:
+                pos = get_position_at(f, t)
+                if conflict and abs(t - conflict_time) < 1e-6 and i in conflict_idx:
+                    freeze[i] = True
+                    freeze_pos[i] = pos
+
+            points[i].set_data([pos[0]], [pos[1]])
+            points[i].set_3d_properties([pos[2]])
+            trails[i].append(pos)
+            lines[i].set_data([p[0] for p in trails[i]], [p[1] for p in trails[i]])
+            lines[i].set_3d_properties([p[2] for p in trails[i]])
+
+        if conflict and abs(t - conflict_time) < 0.5:
+            loc = conflict['location']
+            ax.plot([loc[0]], [loc[1]], [loc[2]], 'o', markerfacecolor='none',
+                    markeredgecolor='red', markersize=12, linestyle='None')
+
+        return points + lines
+
+    ani = FuncAnimation(fig, update, frames=np.arange(min_time, max_time + 1),
+                        blit=False, repeat=False)
+    plt.show()
+
+def input_primary_waypoints():
+    print("Enter 3D waypoints (x y z). Type 'done' to finish.")
+    waypoints = []
+    while True:
+        entry = input("> ")
+        if entry.strip().lower() == 'done':
+            break
+        try:
+            x, y, z = map(float, entry.strip().split())
+            waypoints.append(Waypoint(x, y, z))
+        except:
+            print("Invalid input. Format: x y z")
+    if len(waypoints) < 2:
+        raise ValueError("Minimum two waypoints required.")
+    start_time = float(input("Enter start time: "))
+    end_time = float(input("Enter end time: "))
+    return FlightPath("Primary", waypoints, start_time, end_time)
+
+def main():
+    random.seed(42)
+    primary = input_primary_waypoints()
+    drones = generate_parallel_simulated_drones(primary, num_drones=6)
+    conflict = detect_conflicts(primary, drones)
+    if conflict:
+        print("Conflict detected:", conflict)
+    else:
+        print("No conflict detected.")
+    animate_drones(primary, drones, conflict)
+
+if __name__ == '__main__':
+    main()
